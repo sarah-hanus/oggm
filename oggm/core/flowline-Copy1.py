@@ -2990,7 +2990,7 @@ def run_with_hydro(gdir, run_task=None, store_monthly_hydro=False, **kwargs):
     fpath = gdir.get_filepath('model_diagnostics', filesuffix=suffix)
     ods.to_netcdf(fpath, mode='a')
     
-def run_with_hydro_daily(gdir, run_task=None, **kwargs):
+def run_with_hydro_daily(gdir, run_task=None, store_daily_hydro=False, **kwargs):
     """Run the flowline model and add hydro diagnostics on daily basis (experimental!).
 
     TODOs:
@@ -3003,9 +3003,12 @@ def run_with_hydro_daily(gdir, run_task=None, **kwargs):
     Parameters
     ----------
     run_task : func
-        any of the `run_*`` tasks in the MBSandbox.flowline_TIModel module.
+        any of the `run_*`` tasks in the oggm.flowline module.
         The mass-balance model used needs to have the `add_climate` output
         kwarg available though.
+    store_daily_hydro : bool
+        also compute monthly hydrological diagnostics. The monthly ouptputs
+        are stored in 2D fields (years, months)
     **kwargs : all valid kwargs for ``run_task``
     """
 
@@ -3073,11 +3076,15 @@ def run_with_hydro_daily(gdir, run_task=None, **kwargs):
 
     # Ok now we have arrays, we can work with that
     # -> second time varying loop is for mass-balance
+    m = 1
+    seconds = cfg.SEC_IN_YEAR
     ntime = len(years) + 1
-    #for each year store 366 values #last one should be 0 or nann in non leap years
-    oshape = (ntime, 366)
-    #for daily usage
-    seconds = cfg.SEC_IN_DAY
+    oshape = (ntime, 1)
+    if store_daily_hydro:
+        #for each year store 366 values #last one should be 0 or nann in non leap years
+        oshape = (ntime, 366)
+        #for daily usage
+        seconds = 3600*24
 
     out = {
         'off_area': {
@@ -3176,16 +3183,22 @@ def run_with_hydro_daily(gdir, run_task=None, **kwargs):
             off_area = utils.clip_min(max_area - bin_area, 0)
 
             try:
-                #daily massbalance has 365 days a year and per day it has a number of entries equal to number of heights/weights
-                try:
-                    mb_out = mb_mod.get_daily_mb(bin_elev, fl_id=fl_id,
-                                               year=yr,
-                                               add_climate=True)
+                if store_daily_hydro:
+                    #this has to be adjusted to daily??
+                    #gives list of mb for each year and height
+                    #daily massbalance has 365 days a year and per day it has a number of entries equal to number of heights/weights
+                    try:
+                        mb_out = mb_mod.get_daily_mb(bin_elev, fl_id=fl_id,
+                                                   year=yr,
+                                                   add_climate=True)
+                    except:
+                        raise InvalidWorkflowError('Run with hydro daily needs a daily MB '
+                                   'model, so it can only run with TIModel.')
                     mb, _, _, prcp, prcpsol = mb_out
-                except:
-                    raise InvalidWorkflowError('Run with hydro daily needs a daily MB '
-                               'model, so it can only run with TIModel.')
-                    
+                else:
+                    mb_out = mb_mod.get_annual_mb(bin_elev, fl_id=fl_id,
+                                                  year=yr, add_climate=True)
+                    mb, _, _, prcp, prcpsol = mb_out
             except ValueError as e:
                 if 'too many values to unpack' in str(e):
                     raise InvalidWorkflowError('Run with hydro needs a MB '
@@ -3203,8 +3216,9 @@ def run_with_hydro_daily(gdir, run_task=None, **kwargs):
             mb_bias = mb_mod.bias * seconds / cfg.SEC_IN_YEAR
 
             # on daily basis prcp has shape (bins, days in year) bin_area must have shape (bins,1)
-            bin_area = bin_area[:, np.newaxis]
-            off_area = off_area[:, np.newaxis]
+            if store_daily_hydro:
+                bin_area = bin_area[:, np.newaxis]
+                off_area = off_area[:, np.newaxis]
             liq_prcp_on_g = (prcp - prcpsol) * bin_area
             liq_prcp_off_g = (prcp - prcpsol) * off_area
 
@@ -3227,22 +3241,29 @@ def run_with_hydro_daily(gdir, run_task=None, **kwargs):
             # Update bucket with accumulation and melt
             #snow bucket has size (heights, 366) but prcpsol_off_g only has (heights, 365 if no leap year)
             #so we have to add a column to 
-            days_in_year = len(np.sum(melt_off_g, axis=0))
-            if days_in_year == 365:
-                prcpsol_off_g = np.c_[prcpsol_off_g, np.zeros(len(bin_elev))]
-                melt_off_g = np.c_[melt_off_g, np.zeros(len(bin_elev))]
-
-            #loop through all days to get snow bucket correctly
-            snow_bucket_daily = np.zeros((len(snow_bucket), 366))
-            for day in range(366):
-                #you have to have snow bucket from day before that gets updated
-                #but you also have to store it before
-                snow_bucket += prcpsol_off_g[:,day]
+            if store_daily_hydro:
+                days_in_year = len(np.sum(melt_off_g, axis=0))
+                if days_in_year == 365:
+                    prcpsol_off_g = np.c_[prcpsol_off_g, np.zeros(len(bin_elev))]
+                    melt_off_g = np.c_[melt_off_g, np.zeros(len(bin_elev))]
+                    
+                #loop through all days to get snow bucket correctly
+                snow_bucket_daily = np.zeros((len(snow_bucket), 366))
+                for day in range(366):
+                    #you have to have snow bucket from day before that gets updated
+                    #but you also have to store it before
+                    snow_bucket += prcpsol_off_g[:,day]
+                    # It can only melt that much
+                    melt_off_g[:,day] = np.where((snow_bucket - melt_off_g[:,day]) >= 0, melt_off_g[:,day], snow_bucket)
+                    # Update bucket
+                    snow_bucket -= melt_off_g[:,day]
+                    snow_bucket_daily[:,day] = snow_bucket
+            else:  
+                snow_bucket += prcpsol_off_g
                 # It can only melt that much
-                melt_off_g[:,day] = np.where((snow_bucket - melt_off_g[:,day]) >= 0, melt_off_g[:,day], snow_bucket)
+                melt_off_g = np.where((snow_bucket - melt_off_g) >= 0, melt_off_g, snow_bucket)
                 # Update bucket
-                snow_bucket -= melt_off_g[:,day]
-                snow_bucket_daily[:,day] = snow_bucket
+                snow_bucket -= melt_off_g
 
             # This is recomputed each month but well
             #TO DO: why do you sum it up each month, how do you deal with it on daily basis
@@ -3251,23 +3272,38 @@ def run_with_hydro_daily(gdir, run_task=None, **kwargs):
 
             # Monthly out
             #we want daily output of all bins, so the bins have to be summed up, but not all days
+            #print("melt on ", out['melt_on_glacier']['data'][i, :].sum())
             # e.g. np.sum(prcp, axis=0) gives an array of (365,)
             #if not a leap year, the last day will remain 0
-            out['melt_off_glacier']['data'][i, :] = np.sum(melt_off_g, axis=0)
-            out['melt_on_glacier']['data'][i, :days_in_year] = np.sum(melt_on_g, axis=0)
-            out['melt_residual_off_glacier']['data'][i, :days_in_year] = np.sum(bias_off_g, axis=0)
-            out['melt_residual_on_glacier']['data'][i, :days_in_year] = np.sum(bias_on_g, axis=0)
-            out['liq_prcp_off_glacier']['data'][i, :days_in_year] = np.sum(liq_prcp_off_g, axis=0)
-            out['liq_prcp_on_glacier']['data'][i, :days_in_year] = np.sum(liq_prcp_on_g, axis=0)
-            out['snowfall_off_glacier']['data'][i, :] = np.sum(prcpsol_off_g, axis=0)
-            out['snowfall_on_glacier']['data'][i, :days_in_year] = np.sum(prcpsol_on_g, axis=0)
+            if store_daily_hydro:
+                out['melt_off_glacier']['data'][i, :] = np.sum(melt_off_g, axis=0)
+                out['melt_on_glacier']['data'][i, :days_in_year] = np.sum(melt_on_g, axis=0)
+                out['melt_residual_off_glacier']['data'][i, :days_in_year] = np.sum(bias_off_g, axis=0)
+                out['melt_residual_on_glacier']['data'][i, :days_in_year] = np.sum(bias_on_g, axis=0)
+                out['liq_prcp_off_glacier']['data'][i, :days_in_year] = np.sum(liq_prcp_off_g, axis=0)
+                out['liq_prcp_on_glacier']['data'][i, :days_in_year] = np.sum(liq_prcp_on_g, axis=0)
+                out['snowfall_off_glacier']['data'][i, :] = np.sum(prcpsol_off_g, axis=0)
+                out['snowfall_on_glacier']['data'][i, :days_in_year] = np.sum(prcpsol_on_g, axis=0)
+                
+            else: 
+                out['melt_off_glacier']['data'][i, m-1] += np.sum(melt_off_g)
+                out['melt_on_glacier']['data'][i, m-1] += np.sum(melt_on_g)
+                out['melt_residual_off_glacier']['data'][i, m-1] += np.sum(bias_off_g)
+                out['melt_residual_on_glacier']['data'][i, m-1] += np.sum(bias_on_g)
+                out['liq_prcp_off_glacier']['data'][i, m-1] += np.sum(liq_prcp_off_g)
+                out['liq_prcp_on_glacier']['data'][i, m-1] += np.sum(liq_prcp_on_g)
+                out['snowfall_off_glacier']['data'][i, m-1] += np.sum(prcpsol_off_g)
+                out['snowfall_on_glacier']['data'][i, m-1] += np.sum(prcpsol_on_g)
 
             # Snow bucket is a state variable - stored at end of timestamp
-            #last day of year has to be stored as the first one for next year
-            #BE CAREFUL WITH LEAP YEARS!!!
-            #the last day is zero without leap years!!! so you should take the real last day
-            out['snow_bucket']['data'][i+1, 0] += np.sum(snow_bucket_daily, axis=0)[-1]
-            out['snow_bucket']['data'][i, 1:] += np.sum(snow_bucket_daily, axis=0)[:-1]
+            if store_daily_hydro:
+                #last day of year has to be stored as the first one for next year
+                #BE CAREFUL WITH LEAP YEARS!!!
+                #the last day is zero without leap years!!! so you should take the real last day
+                out['snow_bucket']['data'][i+1, 0] += np.sum(snow_bucket_daily, axis=0)[-1]
+                out['snow_bucket']['data'][i, 1:] += np.sum(snow_bucket_daily, axis=0)[:-1]
+            else:
+                out['snow_bucket']['data'][i+1, m-1] += np.sum(snow_bucket)
                 
 
         # Update the annual data
@@ -3275,25 +3311,27 @@ def run_with_hydro_daily(gdir, run_task=None, **kwargs):
         out['off_area']['data'][i] = off_area_out
         out['on_area']['data'][i] = on_area_out
 
-        #put the residual where we can
-        for melt, bias in zip(
-                [
-                    out['melt_on_glacier']['data'][i, :],
-                    out['melt_off_glacier']['data'][i, :],
-                ],
-                [
-                    out['melt_residual_on_glacier']['data'][i, :],
-                    out['melt_residual_off_glacier']['data'][i, :],
-                ],
-        ):
+        # If monthly, put the residual where we can
+        #hope this also works with daily 
+        if store_daily_hydro:
+            for melt, bias in zip(
+                    [
+                        out['melt_on_glacier']['data'][i, :],
+                        out['melt_off_glacier']['data'][i, :],
+                    ],
+                    [
+                        out['melt_residual_on_glacier']['data'][i, :],
+                        out['melt_residual_off_glacier']['data'][i, :],
+                    ],
+            ):
 
-            real_melt = melt - bias
-            real_melt_sum = np.sum(real_melt)
-            bias_sum = np.sum(bias)
-            if real_melt_sum > 0:
-                # Ok we correct the positive melt instead
-                fac = 1 + bias_sum / real_melt_sum
-                melt[:] = real_melt * fac
+                real_melt = melt - bias
+                real_melt_sum = np.sum(real_melt)
+                bias_sum = np.sum(bias)
+                if real_melt_sum > 0:
+                    # Ok we correct the positive melt instead
+                    fac = 1 + bias_sum / real_melt_sum
+                    melt[:] = real_melt * fac
         
         # Correct for mass-conservation and match the ice-dynamics model
         fmod.run_until(yr + 1)
@@ -3305,56 +3343,55 @@ def run_with_hydro_daily(gdir, run_task=None, **kwargs):
         residual_mb = model_mb - reconstructed_mb
 
         # Now correct
-        # We try to correct the melt only where there is some
-        asum = out['melt_on_glacier']['data'][i, :].sum()
-        if asum > 1e-7 and (residual_mb / asum < 1):
-            # try to find a fac
-            fac = 1 - residual_mb / asum
-            corr = out['melt_on_glacier']['data'][i, :] * fac
-            residual_mb = out['melt_on_glacier']['data'][i, :] - corr
-            out['melt_on_glacier']['data'][i, :] = corr
+        if store_daily_hydro:
+            # We try to correct the melt only where there is some
+            asum = out['melt_on_glacier']['data'][i, :].sum()
+            if asum > 1e-7 and (residual_mb / asum < 1):
+                # try to find a fac
+                fac = 1 - residual_mb / asum
+                corr = out['melt_on_glacier']['data'][i, :] * fac
+                residual_mb = out['melt_on_glacier']['data'][i, :] - corr
+                out['melt_on_glacier']['data'][i, :] = corr
+            else:
+                # We simply spread over the days
+                #TO DO: more sophisticated approach??
+                #with this approach proably more negative melt contributions??
+                residual_mb /= days_in_year
+                out['melt_on_glacier']['data'][i, :] = (out['melt_on_glacier']['data'][i, :] -
+                                                        residual_mb)
         else:
-            # We simply spread over the days
-            #TO DO: more sophisticated approach??
-            #with this approach proably more negative melt contributions??
-            residual_mb /= days_in_year
+            # We simply apply the residual - no choice here
             out['melt_on_glacier']['data'][i, :] = (out['melt_on_glacier']['data'][i, :] -
                                                     residual_mb)
+        #print("melt off glacier last ", out['melt_off_glacier']['data'][i, :].sum())
+        #print("melt off glacier last ", out['melt_off_glacier']['data'][i, :])
 
         out['model_mb']['data'][i] = model_mb
         out['residual_mb']['data'][i] = residual_mb
-        
-        vars = ['melt_off_glacier', 'melt_on_glacier', 'melt_residual_off_glacier', 'melt_residual_on_glacier', 'liq_prcp_off_glacier', 'liq_prcp_on_glacier', 'snowfall_off_glacier', 'snowfall_on_glacier']
-        if days_in_year == 365:
-            for var in vars:
-                out[var]['data'][i, -1] = np.NaN
-                if True == True:
-                    #this is basically just for testing
-                    #don't use it for the real version
-                    out[var]['data'][i, :] = np.concatenate((out[var]['data'][i, :59],np.array([np.NaN]), out[var]['data'][i, 59:-1]))
 
     # Convert to xarray
     out_vars = cfg.PARAMS['store_diagnostic_variables']
     ods = xr.Dataset()
     ods.coords['time'] = fmod.years
-    ods.coords['day_2d'] = ('day_2d', np.arange(1, 367))
-    # For the user later
-    #if nh = 10, if sh = 4
-    #first day of October 274 (leapyear 275)
-    #first day of April 91 (leapyear 92)
-    sm = cfg.PARAMS['hydro_month_' + mb_mod.hemisphere]
-    #in Lili's massbalance this is 1 for nh and 4 for sh 
-    #TO DO: something is wrong here!!!
-    #sm should be one
-    if sm == 10:
-        dayofyear = 275
-    elif sm == 4:
-        dayofyear = 92
-    elif sm == 1: 
-        #like in Lili's model
-        dayofyear = 1
-    ods.coords['calendar_day_2d'] = ('day_2d', (np.arange(366) + dayofyear - 1) % 366 + 1)
-    #so the dataset is made with leapyears, because that is longest, for non leap year this has to be kept in mind
+    if store_daily_hydro:
+        ods.coords['day_2d'] = ('day_2d', np.arange(1, 367))
+        # For the user later
+        #if nh = 10, if sh = 4
+        #first day of October 274 (leapyear 275)
+        #first day of April 91 (leapyear 92)
+        sm = cfg.PARAMS['hydro_month_' + mb_mod.hemisphere]
+        #in Lili's massbalance this is 1 for nh and 4 for sh 
+        #TO DO: something is wrong here!!!
+        #sm should be one
+        if sm == 10:
+            dayofyear = 275
+        elif sm == 4:
+            dayofyear = 92
+        elif sm == 1: 
+            #like in Lili's model
+            dayofyear = 1
+        ods.coords['calendar_day_2d'] = ('day_2d', (np.arange(366) + dayofyear - 1) % 366 + 1)
+        #so the dataset is made with leapyears, because that is longest, for non leap year this has to be kept in mind
     for varname, d in out.items():
         data = d.pop('data')
         if varname not in out_vars:
@@ -3367,11 +3404,12 @@ def run_with_hydro_daily(gdir, run_task=None, **kwargs):
             else:
                 # Last year is never good
                 data[-1, :] = np.NaN
-                var_annual = np.nansum(data, axis=1)
-                var_annual[-1] = np.NaN
-                ods[varname] = ('time', var_annual)
+                ods[varname] = ('time', np.sum(data, axis=1))
+                print(np.shape(np.sum(data, axis=1)))
             # Then the daily ones
-            ods[varname + '_daily'] = (('time', 'day_2d'), data)
+            if store_daily_hydro:
+                print(np.shape(data))
+                ods[varname + '_daily'] = (('time', 'day_2d'), data)
         else:
             assert varname != 'snow_bucket'
             data[-1] = np.NaN
