@@ -3035,7 +3035,7 @@ def run_with_hydro_daily(gdir, run_task=None, **kwargs):
     fmod = FileModel(gdir.get_filepath('model_geometry', filesuffix=suffix))
     # The last one is the final state - we can't compute MB for that
     years = fmod.years[:-1]
-
+    
     # Geometry at t0 to start with + off-glacier snow bucket
     bin_area_2ds = []
     bin_elev_2ds = []
@@ -3072,6 +3072,7 @@ def run_with_hydro_daily(gdir, run_task=None, **kwargs):
 
     # Ok now we have arrays, we can work with that
     # -> second time varying loop is for mass-balance
+>>>>>>> b05f51b... changes in MBsandbox, daily hydro output
     ntime = len(years) + 1
     #for each year store 366 values #last one should be 0 or nann in non leap years
     oshape = (ntime, 366)
